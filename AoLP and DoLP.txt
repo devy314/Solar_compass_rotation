@@ -1,0 +1,38 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Load image
+img = cv2.imread(r"G:\my\New Project\image(1).jpg", cv2.IMREAD_GRAYSCALE).astype(np.float32)
+
+# Extract S0, S1, S2
+S0 = img[:2048, :2048]        
+S1 = img[:2048, 2048:]    
+S2 = img[2048:, :2048]   
+
+S0 = S0/255.0
+S1 = (2 * (S1/255.0)) -1
+S2 = (2 * (S2/255.0)) -1
+
+# Calculate DoLP and AoLP
+pre_DoLP = np.sqrt((S1**2) + (S2**2))
+DoLP = pre_DoLP/S0
+# DoLP = np.clip(DoLP, 0, 1) 
+
+AoLP = 0.5 * np.arctan2(S2, S1)
+AoLP_deg = np.degrees(AoLP)
+
+# Plot
+plt.figure(figsize=(12, 5))
+plt.subplot(1, 2, 1)
+plt.imshow(DoLP, cmap='jet', vmin=0, vmax=1)
+plt.colorbar(label='DoLP')
+plt.title('Degree of Linear Polarization')
+
+plt.subplot(1, 2, 2)
+plt.imshow(AoLP_deg, cmap='jet', vmin=-90, vmax=90)
+plt.colorbar(label='AoLP (degrees)')
+plt.title('Angle of Linear Polarization')
+
+plt.tight_layout()
+plt.show()

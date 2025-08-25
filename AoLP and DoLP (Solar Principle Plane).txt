@@ -1,0 +1,44 @@
+import cv2                      
+import numpy as np              
+import matplotlib.pyplot as plt 
+
+img = cv2.imread(r"G:\my\New Project\image(1).jpg", cv2.IMREAD_GRAYSCALE).astype(np.float32)  # load grayscale image as float32
+
+S0 = img[0:2048, 0:2048]        
+S1 = img[0:2048, 2048:]         
+S2 = img[2048:, 0:2048]         
+
+S0 = S0 / 255.0                 
+S1 = (2 * (S1 / 255.0)) - 1     
+S2 = (2 * (S2 / 255.0)) - 1    
+
+rows, cols = S0.shape           # image dimensions 
+cx, cy = cols // 2, rows // 2   # center coordinates 
+X, Y = np.meshgrid(np.arange(cols) - cx, np.arange(rows) - cy)  # centered coordinate grids
+
+alpha = np.abs(np.arctan2(Y, X) - np.pi)  # pixel azimuth w.r.t. center (abs for principal-plane convention)
+# alpha = (np.arctan2(Y, X) - np.pi)      # use this (no abs) if you need signed angles
+
+S1_s = np.cos(2 * alpha) * S1 + np.sin(2 * alpha) * S2  
+S2_s = -np.sin(2 * alpha) * S1 + np.cos(2 * alpha) * S2  
+
+DoLP = np.sqrt(S1_s**2 + S2_s**2) / (S0)  # Degree of Linear Polarization 
+AoLP = 0.5 * np.arctan2(S2_s, S1_s)      # Angle of Linear Polarization 
+AoLP_deg = np.degrees(AoLP)              # convert AoLP to degrees 
+
+plt.figure(figsize=(12, 5))              # make a wide figure
+
+plt.subplot(1, 2, 1)                     
+plt.imshow(DoLP, cmap='jet', vmin=0, vmax=1)      
+plt.colorbar(label='DoLP')                       
+plt.title('DoLP (Solar Principal Plane)')        
+plt.axis('off')                                  
+
+plt.subplot(1, 2, 2)                     
+plt.imshow(AoLP_deg, cmap='jet', vmin=-90, vmax=90)  
+plt.colorbar(label='AoLP (degrees)')               
+plt.title('AoLP (Solar Principal Plane)')          
+plt.axis('off')                                    
+
+plt.tight_layout()                       
+plt.show()                               

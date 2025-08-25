@@ -1,0 +1,120 @@
+import cv2, numpy as np, matplotlib.pyplot as plt  
+
+# --- paths ---
+p1 = r"G:\my\New Project\2024-10-08-19-31-33_angle_0.png"  
+p2 = r"G:\my\New Project\2024-10-08-19-31-39_angle_31.png" 
+
+# --- load ---
+img1c = cv2.imread(p1, cv2.IMREAD_COLOR)       
+img2c = cv2.imread(p2, cv2.IMREAD_COLOR)       
+img1g = cv2.imread(p1, cv2.IMREAD_GRAYSCALE).astype(np.float32)  
+img2g = cv2.imread(p2, cv2.IMREAD_GRAYSCALE).astype(np.float32)  
+if img1c is None or img2c is None: raise FileNotFoundError("Check p1/p2 paths")  # check if loading failed
+
+# same size
+if img1c.shape[:2] != img2c.shape[:2]:   # if the images are not the same size
+    img2c = cv2.resize(img2c, (img1c.shape[1], img1c.shape[0]), cv2.INTER_NEAREST)  # resize image 2 color
+    img2g = cv2.resize(img2g, (img1g.shape[1], img1g.shape[0]), cv2.INTER_NEAREST)  # resize image 2 grayscale
+
+h, w = img1g.shape              # get height and width of image
+cx, cy = (w-1)/2.0, (h-1)/2.0   # calculate image center (x,y)
+
+# circular mask
+r = min(h, w)//2 - 2            # radius for circular mask (fit inside image)
+Y, X = np.ogrid[:h, :w]         # create grid of coordinates
+mask = ((X-cx)**2 + (Y-cy)**2) <= r*r   # circle mask: True inside, False outside
+mask_idx = np.flatnonzero(mask.ravel()) # flatten mask indices for sampling
+
+
+to_deg = lambda g: g * (180.0/255.0)  # convert grayscale [0–255] to angle [0–180]
+
+def aolp_diff(a, b):            # function to compute angular difference
+    d = np.abs(a-b)             # absolute difference
+    return np.minimum(d, 180.0-d)  # ensure difference wraps at 180° correctly
+
+def rotate(img, ang):           # function to rotate an image by angle
+    M = cv2.getRotationMatrix2D((cx, cy), ang, 1.0)  # rotation matrix around center
+    return cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_REFLECT)  # warp image
+
+deg1 = to_deg(img1g)            # convert image 1 grayscale into degree scale
+
+def loss(ang, batch=None, rng=None):   # loss function: difference between img1 and rotated img2
+    d2 = to_deg(rotate(img2g, ang))    # rotate image 2 and convert to degrees
+    if batch and batch < mask_idx.size:   # if using mini-batch
+        if rng is None: rng = np.random.default_rng()  # create random generator
+        sel = rng.choice(mask_idx, size=batch, replace=False)  # randomly choose subset of pixels
+        return aolp_diff(deg1.ravel()[sel], d2.ravel()[sel]).mean()  # compute mean angular difference
+    return aolp_diff(deg1[mask], d2[mask]).mean()  # full mask difference if no mini-batch
+
+def to_rgba(bgr, m):            # convert image to RGBA with mask as alpha
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)  # convert BGR → RGB
+    return np.dstack([rgb, (m*255).astype(np.uint8)])  # stack mask as alpha channel
+
+
+# --- rough (10°) search ---
+rough_angles = np.arange(-180.0, 180.0, 10.0)   # test angles from -180° to 180° with 10° steps
+rough_losses = [loss(a) for a in rough_angles]  # compute loss for each angle
+best_rough = float(rough_angles[int(np.argmin(rough_losses))])  # angle with lowest loss (rough estimate)
+
+# --- fine (0.01°) search in ±5° window around rough best ---
+fine_start, fine_end = best_rough - 5.0, best_rough + 5.0  # narrow search window
+fine_angles = np.arange(fine_start, fine_end, 0.01, dtype=np.float32)  # generate fine steps
+fine_losses = [loss(a) for a in fine_angles]  # compute loss for each fine angle
+best_fine_angle = float(fine_angles[int(np.argmin(fine_losses))])  # best fine angle
+best_fine_loss  = float(np.min(fine_losses))  # best fine loss
+
+# --- SGD (stochastic gradient descent) optimization ---
+rng = np.random.default_rng(123)   # random number generator
+ang = best_fine_angle              # start SGD from fine best angle
+lr, eps = 0.12, 0.05               # learning rate and finite difference step
+batch, iters, decay = 30000, 120, 0.98  # batch size, number of iterations, decay factor
+
+sgd_loss_hist = []                 # list to store loss per iteration
+best_sgd_angle, best_sgd_loss = ang, loss(ang, batch, rng)  # initialize best angle and loss
+
+for _ in range(iters):             # loop over iterations
+    L  = loss(ang, batch, rng)     # loss at current angle
+    Lp = loss(ang+eps, batch, rng) # loss at angle + eps
+    Lm = loss(ang-eps, batch, rng) # loss at angle - eps
+    g = (Lp - Lm) / (2*eps)        # numerical gradient (slope)
+    ang -= lr * g                  # update angle using gradient descent
+    if ang >= 180: ang -= 360      # wrap angle into [-180, 180)
+    if ang < -180: ang += 360
+    sgd_loss_hist.append(L)        # store current loss
+    if L < best_sgd_loss: best_sgd_angle, best_sgd_loss = ang, L  # update best if improved
+    lr *= decay                    # reduce learning rate gradually
+
+# --- choose final angle ---
+final_angle, final_loss = (best_fine_angle, best_fine_loss) if best_fine_loss <= best_sgd_loss else (best_sgd_angle, best_sgd_loss)
+
+# --- show images ---
+rot2c = rotate(img2c, final_angle) # rotate image 2 by final angle
+
+plt.figure(figsize=(12,4))         # create figure
+plt.subplot(1,3,1); plt.imshow(to_rgba(img1c, mask)); plt.title("Image 1"); plt.axis('off')  # show image 1
+plt.subplot(1,3,2); plt.imshow(to_rgba(img2c, mask)); plt.title("Image 2"); plt.axis('off')  # show image 2
+plt.subplot(1,3,3); plt.imshow(to_rgba(rot2c, mask)); plt.title(f"Rotated {final_angle:.4f}°"); plt.axis('off') # show rotated image
+plt.tight_layout(); plt.show()     # adjust layout and show
+
+# --- plot loss vs angle (fine search) ---
+plt.figure(figsize=(10,5))         # create figure
+#plt.plot(rough_angles, rough_losses, marker='o', linewidth=1, label="Rough 10°")  # (optional) plot rough search
+plt.plot(fine_angles, fine_losses, linewidth=1, label=f"0.01° Steps", color='red') # plot fine search curve
+plt.axvline(final_angle, linestyle='--', label=f"Chosen = {final_angle:.4f}°",color='black') # vertical line at chosen angle
+plt.xlim(25,35)                    # zoom in x-axis
+plt.title("Loss vs Angle")         # title
+plt.xlabel("Angle (deg)"); plt.ylabel("Mean AoLP diff (deg)") # labels
+plt.grid(False); plt.legend(); plt.show()  # show legend and plot
+
+# --- plot SGD loss vs iteration ---
+plt.figure(figsize=(8,4))          # create figure
+plt.plot(sgd_loss_hist)            # plot loss history
+plt.xlim(0,120)                    # x-axis limit
+plt.title("SGD Loss (mini-batches)") # title
+plt.xlabel("Iteration"); plt.ylabel("Loss"); plt.grid(False) # labels
+plt.tight_layout(); plt.show()     # adjust layout and show
+
+# --- print results ---
+print(f"Rough best = {best_rough:.2f}°")                   # print rough best angle
+print(f"Fine angle = {best_fine_angle:.4f}°, loss = {best_fine_loss:.6f}") # print fine search result
+print(f"SGD best angle = {best_sgd_angle:.4f}°, loss = {best_sgd_loss:.6f}") # print SGD result

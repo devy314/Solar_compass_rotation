@@ -1,0 +1,84 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ----- paths -----
+p1 = r"G:\my\New Project\2024-10-08-19-31-33_angle_0.png"   # reference (target) image
+p2 = r"G:\my\New Project\2024-10-08-19-31-39_angle_31.png"  # image to be rotated/aligned
+
+# ----- load color (for display) and grayscale (for AoLP math) -----
+img1c = cv2.imread(p1, cv2.IMREAD_COLOR)          # load Image 1 in color (BGR) for display
+img2c = cv2.imread(p2, cv2.IMREAD_COLOR)          # load Image 2 in color (BGR) for display
+img1g = cv2.imread(p1, cv2.IMREAD_GRAYSCALE).astype(np.float32)  # same Image 1 as 1-channel float
+img2g = cv2.imread(p2, cv2.IMREAD_GRAYSCALE).astype(np.float32)  # same Image 2 as 1-channel float
+
+# match sizes to img1 (resize img2 to exactly match img1 if needed)
+if img1c.shape[:2] != img2c.shape[:2]:
+    img2c = cv2.resize(img2c, (img1c.shape[1], img1c.shape[0]), interpolation=cv2.INTER_NEAREST)
+    img2g = cv2.resize(img2g, (img1g.shape[1], img1g.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+h, w = img1g.shape                               # image height and width (from grayscale)
+cx, cy = (w - 1)/2.0, (h - 1)/2.0                # rotation center: exact image center (float)
+
+# circular mask (compare only inside a circle to avoid edge artifacts)
+r = min(h, w)//2 - 2                             # circle radius (slightly smaller than half-size)
+Y, X = np.ogrid[:h, :w]                          # fast grid for distance computation
+mask = ((X - cx)**2 + (Y - cy)**2) <= (r*r)      # boolean mask: True inside the circle
+
+# --- AoLP helpers (calculation only; display uses original color) ---
+def to_deg(gray):                                 # map 0-255 grayscale to 0-180 degrees
+    return gray * (180.0/255.0)
+
+def aolp_diff(a, b):                              # angular difference on a 0..180° circle
+    d = np.abs(a - b)                             # raw absolute difference
+    return np.minimum(d, 180.0 - d)               # wrap-around (because AoLP is modulo 180°)
+
+def rotate_center(img, ang):                      # rotate an image 'ang' degrees around center
+    M = cv2.getRotationMatrix2D((cx, cy), ang, 1.0)  # 2×3 rotation matrix (scale=1)
+    return cv2.warpAffine(                           # apply rotation
+        img, M, (w, h),
+        flags=cv2.INTER_NEAREST,                     # fast, preserves labels if any
+        borderMode=cv2.BORDER_REFLECT                # reflect edges to reduce border artifacts
+    )
+
+#brute-force search over angles to find the minimum AoLP difference
+deg1 = to_deg(img1g)                               # Image 1 "angles" (mapped from grayscale)
+angles = np.arange(-180.0, 180.0, 0.1)            # test every 0.1° across full range
+best_angle = min(                                  # choose angle that minimizes masked mean diff
+    angles,
+    key=lambda ang: aolp_diff(                     # compute AoLP difference for this angle
+        deg1,
+        to_deg(rotate_center(img2g, ang))
+    )[mask].mean()                                 # average difference only inside mask
+)
+
+rot2c = rotate_center(img2c, best_angle)           # rotate the color Image 2 by best_angle (for display)
+
+def make_rgba(bgr, circle_mask):                   # convert BGR to RGBA and apply circular alpha
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)     
+    a = (circle_mask * 255).astype(np.uint8)       # alpha channel: 255 inside circle, 0 outside
+    return np.dstack([rgb, a])                     # stack into RGBA image for clean circular view
+
+# precompute RGBA overlays for visualization
+img1_rgba = make_rgba(img1c, mask)                 # Image 1 with circular alpha
+img2_rgba = make_rgba(img2c, mask)                 # Image 2 (original) with circular alpha
+rot2_rgba = make_rgba(rot2c, mask)                 # Image 2 (rotated) with circular alpha
+
+
+plt.figure(figsize=(12, 4))
+plt.subplot(1, 3, 1); plt.imshow(img1_rgba); 
+plt.title("Image 1 (circular)"); 
+plt.axis('off')
+plt.subplot(1, 3, 2); 
+plt.imshow(img2_rgba);
+plt.title("Image 2 (circular)");
+plt.axis('off')
+plt.subplot(1, 3, 3); 
+plt.imshow(rot2_rgba);
+plt.title(f"Image 2 rotated {best_angle:.2f}°"); 
+plt.axis('off')
+plt.tight_layout();
+plt.show()
+
+
+print(f"The angular difference is {best_angle:.2f}")
