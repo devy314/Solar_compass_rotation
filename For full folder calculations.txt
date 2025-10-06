@@ -1,0 +1,244 @@
+import cv2, numpy as np, pandas as pd, os, re, time  # import needed libraries
+
+# ----------------------- SETTINGS -----------------------
+FOLDER = r"G:\my\New Project\24-10-08-t000-forward-paradesquare-aolp"   # folder containing all AoLP images
+Reference_Path = r"G:\my\New Project\2024-10-08-19-31-33_angle_0.png"   # base image used for alignment comparison
+excel = os.path.join(FOLDER, "azimuth_results.xlsx")                    # output Excel file where results will be saved
+
+# Scan/sampling configuration
+Minimum_side_size = 384    # downscale large images so that the shorter side = 384 pixels (faster computation)
+sample_pixel      = 5000   # only use 5000 random pixels per image for loss calculations (saves time)
+starting_point    = 58     # random seed for reproducibility (so you always get same sample pixels)
+
+# Settings for optional Stochastic Gradient Descent (SGD) fine-tuning
+USE_SGD   = True           # set True to enable SGD after fine search
+SGD_LR    = 0.08           # learning rate – how big each step of optimization is
+SGD_EPS   = 0.05           # epsilon – small change used to calculate the gradient numerically
+SGD_ITERS = 30             # number of iterations to run SGD
+SGD_DECAY = 0.98           # how quickly the learning rate decreases over time
+
+
+# HELPER FUNCTIONS 
+
+def wrap360(a: float) -> float:                        # keep any angle between 0–360 degrees
+    return float(a % 360.0)
+
+def shortest_angle(d: float) -> float:                 # find the shortest angle difference (−180 to +180)
+    return ((float(d) + 180.0) % 360.0) - 180.0
+
+def degree(g: np.ndarray) -> np.ndarray:               # convert 0–255 grayscale to 0–180 degree AoLP values
+    return g.astype(np.float32) * (180.0 / 255.0)
+
+def aolp_diff(a: np.ndarray, b: np.ndarray) -> np.ndarray:  # measure the angular difference between two AoLP maps
+    d = np.abs(a - b)                                  # direct difference
+    return np.minimum(d, 180.0 - d)                    # wrap-around fix (since 0° and 180° represent same direction)
+
+def build_mask(h: int, w: int, margin: int = 2) -> np.ndarray:
+    """Create a circular mask centered in the image so corners are ignored."""
+    cx, cy = (w - 1)/2.0, (h - 1)/2.0                  # center of the image
+    r = min(h, w)//2 - margin                          # radius, leaving a small 2-pixel margin
+    Y, X = np.ogrid[:h, :w]                            # create grid coordinates
+    return ((X - cx)**2 + (Y - cy)**2) <= r*r          # True inside the circle, False outside
+
+def my_true_angle(name: str):                          # try to read the true rotation from filename (e.g. angle_238.png)
+    m = re.search(r"angle[_-](\d+(?:\.\d+)?)", name, flags=re.IGNORECASE)  # search for numbers after 'angle_' or 'angle-'
+    return float(m.group(1)) if m else None            # if found, return as float; else return None
+
+
+
+# Search filename for a pattern like 'angle_238' or 'angle-15'
+# r"angle[_-](\d+(?:\.\d+)?)" means:
+#   'angle' → literal text
+#   '[_-]'  → underscore or hyphen
+#   '(\d+(?:\.\d+)?)' → a number (integer or decimal)
+# IGNORECASE makes it match even if 'Angle' or 'ANGLE'
+
+
+
+#  MAIN ROTATION FUNCTION 
+def rotation(img1g: np.ndarray, img2g: np.ndarray,
+             target_scan_min_side: int = Minimum_side_size,
+             sample_pixels: int = sample_pixel,
+#             rng_seed: int = starting_point) -> float:
+             start_point: int = starting_point) -> float:
+    """
+    Estimate the rotation angle (0–360°) that aligns img2 with img1 in AoLP space.
+    Steps:
+      1. Downscale both images for faster search.
+      2. Randomly pick 5000 pixels for loss evaluation.
+      3. Perform coarse → fine angle search.
+      4. Optionally refine result using SGD.
+    """
+    h, w = img1g.shape                                 # get image size
+    deg1, deg2 = degree(img1g), degree(img2g)          # convert to AoLP degrees (0–180)
+
+    # --- Downscale both images if large ---
+    min_side = min(h, w)
+    if min_side > target_scan_min_side:                # only shrink; don’t enlarge small images
+        scale = target_scan_min_side / float(min_side)
+        dh, dw = int(round(h * scale)), int(round(w * scale))
+        deg1s = cv2.resize(deg1, (dw, dh), interpolation=cv2.INTER_AREA)      # smooth resize for reference
+        deg2s = cv2.resize(deg2, (dw, dh), interpolation=cv2.INTER_NEAREST)   # nearest resize for target
+    else:
+        dh, dw = h, w                                 # keep original size
+        deg1s, deg2s = deg1, deg2
+
+    #  Mask & random pixel sampling
+    mask_s = build_mask(dh, dw)                        # circular mask (ignore corners)
+    idx = np.flatnonzero(mask_s.ravel())               # flatten mask → get valid pixel indices
+    if idx.size == 0:
+        raise ValueError("Sampling mask is empty after scaling. Check image sizes.")
+
+    rng = np.random.default_rng(start_point)              # random number generator (seed = reproducible)
+    sample = rng.choice(idx, size=min(sample_pixels, idx.size), replace=False)  # pick random sample pixels
+    deg1s_flat = deg1s.ravel()                         # flatten image for fast indexing
+    cx_s, cy_s = (dw - 1)/2.0, (dh - 1)/2.0            # image center (for rotation)
+
+    # --- Rotation + loss helper functions ---
+    def rotate_s(img_deg: np.ndarray, ang: float) -> np.ndarray:
+        """Rotate AoLP map by 'ang' degrees."""
+        M = cv2.getRotationMatrix2D((cx_s, cy_s), float(ang), 1.0)
+        return cv2.warpAffine(img_deg, M, (dw, dh), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_REFLECT)
+
+    def loss_sub(a: float) -> float:                   # loss using only the random sample pixels
+        d2 = rotate_s(deg2s, a).ravel()
+        return float(aolp_diff(deg1s_flat[sample], d2[sample]).mean())
+
+    def loss_full_scaled(a: float) -> float:           # loss using full mask (more accurate)
+        d2 = rotate_s(deg2s, a)
+        return float(aolp_diff(deg1s[mask_s], d2[mask_s]).mean())
+
+    # --- Multi-step search (coarse → fine) ---
+    coarse = np.arange(0.0, 360.0, 30.0, dtype=np.float32)      # step every 30 degrees
+    best0 = float(coarse[int(np.argmin([loss_sub(a) for a in coarse]))])  # find the best coarse match
+
+    a10 = (np.arange(best0 - 45.0, best0 + 45.0, 10.0) % 360.0)  # 10° step search around the best coarse angle
+    best10 = float(a10[int(np.argmin([loss_sub(a) for a in a10]))])
+
+    a01 = (np.arange(best10 - 5.0, best10 + 5.0, 0.1) % 360.0)   # refine further using 0.1° step
+    best01 = float(a01[int(np.argmin([loss_sub(a) for a in a01]))])
+
+    a001 = (np.arange(best01 - 1.0, best01 + 1.0, 0.01) % 360.0) # final sweep using 0.01° precision
+    best_angle = float(a001[int(np.argmin([loss_sub(a) for a in a001]))])  # record best fine-tuned angle
+
+    best_loss = loss_full_scaled(best_angle)                     # get loss on full mask for accuracy
+
+
+    sgd_loss_hist = []                                           # keeps loss values for visualization
+    if USE_SGD:
+        ang = best_angle                                         # start from best fine-sweep angle
+        lr, eps, iters, decay = SGD_LR, SGD_EPS, SGD_ITERS, SGD_DECAY
+        best_sgd_angle, best_sgd_loss = ang, loss_sub(ang)       # initialize SGD
+
+        for _ in range(iters):                                   # loop through each iteration
+            L  = loss_sub(ang)
+            Lp = loss_sub(ang + eps)
+            Lm = loss_sub(ang - eps)
+            g  = (Lp - Lm) / (2 * eps)                           # compute gradient (finite difference)
+            ang = wrap360(ang - lr * g)                          # update angle with learning rate
+            sgd_loss_hist.append(L)
+            if L < best_sgd_loss:                                # if better, keep it
+                best_sgd_angle, best_sgd_loss = ang, L
+            lr *= decay                                          # slowly reduce learning rate
+
+        # Compare fine-sweep vs SGD and pick better one
+        cand_full_sgd = loss_full_scaled(best_sgd_angle)
+        final_angle_raw, _ = (
+            (best_angle, best_loss)
+            if best_loss <= cand_full_sgd
+            else (best_sgd_angle, cand_full_sgd)
+        )
+    else:
+        final_angle_raw = best_angle                             # no SGD → use fine sweep directly
+
+    return wrap360(final_angle_raw)                              # ensure angle is within 0–360°
+
+
+# ----------------------- MAIN PROGRAM -----------------------
+def main():
+    start = time.time()                                          # start timing for performance check
+
+    # --- Load reference image ---
+    ref_img = cv2.imread(Reference_Path, cv2.IMREAD_GRAYSCALE)
+    if ref_img is None:
+        raise FileNotFoundError(f"Reference not found: {Reference_Path}")
+    ref_img = ref_img.astype(np.float32)                         # convert to float for precision
+    h, w = ref_img.shape
+
+    # --- Collect all target images from folder ---
+    files = [os.path.join(FOLDER, f) for f in os.listdir(FOLDER)
+             if f.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"))]
+    files = sorted(files)
+    if not files:
+        raise FileNotFoundError(f"No images found in: {FOLDER}")
+
+    results = []                                                 # list to store results for Excel export
+
+    # --- Process each image ---
+    for i, path in enumerate(files, 1):
+        name = os.path.basename(path)
+        true_ang = my_true_angle(name)                           # read true angle from filename (if available)
+
+        img2 = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        if img2 is None:
+            print(f"[WARN] Could not read file: {name}")
+            continue
+        img2 = img2.astype(np.float32)
+        if img2.shape != (h, w):                                 # resize if different from reference
+            img2 = cv2.resize(img2, (w, h), interpolation=cv2.INTER_NEAREST)
+
+        if os.path.abspath(path) == os.path.abspath(Reference_Path):
+            prediction = 0.0                                     # reference image = 0 rotation
+        else:
+            prediction = rotation(ref_img, img2,                 # compute best rotation using AoLP
+                                   target_scan_min_side=Minimum_side_size,
+                                   sample_pixels=sample_pixel,
+                                   start_point=starting_point)
+
+        # --- If true angle known, fix AoLP's 180° symmetry ambiguity ---
+        if true_ang is not None:
+            first_match  = prediction                            # direct match
+            second_match = wrap360(prediction + 180)             # flipped version (AoLP symmetry)
+            error1 = abs(shortest_angle(first_match - true_ang)) # difference from real angle
+            error2 = abs(shortest_angle(second_match - true_ang))
+            prediction = second_match if error2 < error1 else first_match  # choose closer one
+            error_deg = shortest_angle(prediction - true_ang)    # signed error (−180° to +180°)
+            error_pct = abs(error_deg) / 180.0 * 100.0           # convert to % of 180°
+        else:
+            error_deg = np.nan                                   # if no true value, leave blank
+            error_pct = np.nan
+
+        results.append([name, true_ang, prediction, error_deg, error_pct])  # add results row
+
+        # Print progress log to console
+        true_str = f"{true_ang:.1f}°" if true_ang is not None else "—"
+        err_str  = f"{error_deg:.2f}°" if np.isfinite(error_deg) else "—"
+        errp_str = f"{error_pct:.3f}%" if np.isfinite(error_pct) else "—"
+        print(f"[{i}/{len(files)}] {name} → True={true_str}, Pred={prediction:.2f}°, "
+              f"Error={err_str} ({errp_str})")
+
+    # --- Calculate RMSE (Root Mean Square Error) ---
+    arr = np.array(results, dtype=object)
+    finite_mask = np.isfinite(arr[:, 3].astype(float))           # ignore blank (NaN) values
+    valid_errors_deg = arr[finite_mask, 3].astype(float)
+
+    if valid_errors_deg.size > 0:
+        rmse_deg = float(np.sqrt(np.mean(valid_errors_deg**2)))  # RMSE in degrees
+        rmse_pct = rmse_deg / 180.0 * 100.0                     # RMSE as % of 180°
+    else:
+        rmse_deg, rmse_pct = np.nan, np.nan
+
+    dur = time.time() - start                                   # calculate total time
+    print(f"\n RMSE = {rmse_deg:.6f}° ({rmse_pct:.4f}%) over {finite_mask.sum()} labeled images")
+    print(f" Time taken: {dur:.2f}s")
+
+    # --- Save results to Excel ---
+    df = pd.DataFrame(results, columns=["File", "True_Angle(°)", "Predicted_Angle(°)", "Error(°)", "Error(%)"])
+    df.loc[len(df.index)] = ["RMSE", "", "", rmse_deg, rmse_pct]
+    df.to_excel(excel, index=False)
+    print(f"Saved results to: {excel}")
+
+
+# ---- Run the script ----
+if __name__ == "__main__":
+    main()

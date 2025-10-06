@@ -1,0 +1,303 @@
+
+
+import os, re, time                 # os: file paths; re: regex (extract angle from filename); time: timing
+import cv2                          # OpenCV for image I/O, resizing, and rotation (warpAffine)
+import numpy as np                  # NumPy for arrays and math
+import matplotlib.pyplot as plt     # Matplotlib for visualization (figures/plots)
+
+# ----------------------- SETTINGS -----------------------
+Reference_Path = r"G:\my\New Project\2024-10-08-19-31-33_angle_0.png"  # path to the fixed reference image
+Target_Path    = r"G:\my\New Project\24-10-08-t000-forward-paradesquare-aolp\2024-10-08-19-31-37_angle_21.png"  # single target
+
+Minimum_side_size = 384      # if images are large, scanning uses a downscaled copy whose min side is 384 px
+sample_pixel      = 5000     # number of randomly selected pixels (inside mask) used to compute loss efficiently
+starting_point    = 58       # RNG seed so sampling is deterministic/reproducible (I choose it randomly, you can change it)
+
+USE_SGD   = True             # whether to run polishing with finite-difference SGD after fine search
+SGD_LR    = 0.08             # SGD learning rate (step size)
+SGD_EPS   = 0.05             # epsilon for symmetric finite-difference gradient (evaluate at a±ε)
+SGD_ITERS = 30               # number of SGD iterations
+SGD_DECAY = 0.98             # multiplicative decay per iteration (anneal LR over time)
+
+
+
+
+
+
+
+
+# --- Angle utilities and AoLP helpers ---
+
+def wrap360(a: float) -> float:
+    """Wrap any angle to [0, 360). Prevents drift outside canonical range."""
+    return float(a % 360.0)
+
+def shortest_angle(d: float) -> float:
+    """Map an angle to the shortest signed difference in [-180, +180). (+ = CCW, - = CW)"""
+    return ((float(d) + 180.0) % 360.0) - 180.0  # normalize to symmetric range
+
+def degree(g: np.ndarray) -> np.ndarray:
+    """Convert AoLP stored as grayscale [0..255] to degrees [0..180)."""
+    return g.astype(np.float32) * (180.0 / 255.0)  # linear scaling to degrees
+
+def aolp_diff(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """
+    Compute circular AoLP difference respecting 180° symmetry.
+    For AoLP, 0° ≡ 180°, so distance is min(|a-b|, 180-|a-b|).
+    Returns per-pixel differences (same shape as a/b).
+    """
+    d = np.abs(a - b)                  # absolute difference in degrees
+    return np.minimum(d, 180.0 - d)    # wrap via 180° symmetry
+
+def build_mask(h: int, w: int, margin: int = 2) -> np.ndarray:
+    """
+    Create a centered circular mask (True inside disk, False outside).
+    - Ignores corners and border (reduces artifacts and uninformative pixels).
+    - 'margin' keeps the circle slightly inside to avoid boundary effects.
+    """
+    cx, cy = (w - 1)/2.0, (h - 1)/2.0  # geometric center in floating point
+    r = min(h, w)//2 - margin          # radius = half of min side minus small margin
+    Y, X = np.ogrid[:h, :w]            # vectorized coordinate grid
+    return ((X - cx)**2 + (Y - cy)**2) <= r*r  # inside circle => True
+
+def my_true_angle(name: str):
+    """
+    Parse ground-truth angle from filename, e.g., '...angle_21.png' or '...angle-21.jpg'.
+    Returns float angle if found, else None.
+    """
+    m = re.search(r"angle[_-](\d+(?:\.\d+)?)", name, flags=re.IGNORECASE)  # capture digits (with optional decimal)
+    return float(m.group(1)) if m else None
+
+def rotate2d(arr: np.ndarray, ang: float, w: int, h: int, interp=cv2.INTER_NEAREST):
+    """
+    Rotate an image/array 'arr' by 'ang' degrees around center.
+    - Uses cv2.getRotationMatrix2D + warpAffine (fast 2D rotation).
+    - NEAREST interpolation by default (preserves discrete AoLP bins).
+    - BORDER_REFLECT reduces black borders by reflecting content.
+    """
+    M = cv2.getRotationMatrix2D(((w - 1)/2.0, (h - 1)/2.0), float(ang), 1.0)  # 2x3 affine matrix
+    return cv2.warpAffine(arr, M, (w, h), flags=interp, borderMode=cv2.BORDER_REFLECT)
+
+def to_rgba(bgr: np.ndarray, mask_bool: np.ndarray):
+    """
+    Convert BGR (OpenCV default) -> RGB for plotting, and attach alpha channel from mask.
+    - Inside mask => alpha=255 (opaque)
+    - Outside mask => alpha=0 (transparent)
+    Useful to visualize only the evaluation region.
+    """
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)         # convert color space
+    return np.dstack([rgb, mask_bool.astype(np.uint8) * 255])  # add alpha
+
+# ----------------------- CORE: rotation (returns angle + SGD history) -----------------------
+def rotation(img1g: np.ndarray, img2g: np.ndarray,
+             target_scan_min_side: int = Minimum_side_size,
+             sample_pixels: int = sample_pixel,
+             start_point: int = starting_point):
+    """
+    Estimate rotation of img2g relative to img1g in AoLP space.
+    Returns tuple:
+      - final best angle in [0,360) CCW (float)
+      - list of SGD losses per iteration (for plotting)
+      - a function subloss_for(angles) that recomputes subsample loss for any list of angles
+    """
+    h, w = img1g.shape                               # original image size (reference)
+    deg1, deg2 = degree(img1g), degree(img2g)        # convert AoLP 0..255 -> degrees 0..180
+
+    # --- Downscale both AoLP maps for scanning if images are large (speeds up search) ---
+    min_side = min(h, w)                             # shorter side length
+    if min_side > target_scan_min_side:              # only reduce if larger than threshold
+        scale = target_scan_min_side / float(min_side)  # uniform scale factor
+        dh, dw = int(round(h * scale)), int(round(w * scale))  # target scan shape
+        deg1s = cv2.resize(deg1, (dw, dh), interpolation=cv2.INTER_AREA)     # reference downscaled (smooth)
+        deg2s = cv2.resize(deg2, (dw, dh), interpolation=cv2.INTER_NEAREST)  # target downscaled (preserve bins)
+    else:
+        dh, dw = h, w                                # keep original size for scan
+        deg1s, deg2s = deg1, deg2                    # use full-res maps for scanning
+
+    # --- Build a circular mask at scan scale and choose a fixed subsample for stable/fast loss ---
+    mask_s = build_mask(dh, dw)                      # boolean mask (True inside circle)
+    idx = np.flatnonzero(mask_s.ravel())             # 1D indices of True pixels (valid region)
+    if idx.size == 0:
+        raise ValueError("Sampling mask is empty after scaling.")  # safety: avoid empty sampling set
+
+    rng = np.random.default_rng(start_point)         # deterministic RNG (seeded)
+    sample = rng.choice(idx, size=min(sample_pixels, idx.size), replace=False)  # choose subsample indices
+    deg1s_flat = deg1s.ravel()                       # flatten ref AoLP for fast 1D indexing
+
+    cx_s, cy_s = (dw - 1)/2.0, (dh - 1)/2.0         # rotation center at scan scale (float precision)
+    
+    
+    
+    
+
+    def rotate_s(img_deg: np.ndarray, ang: float) -> np.ndarray:
+        """Rotate AoLP degrees array at scan scale by 'ang' degrees (CCW positive)."""
+        M = cv2.getRotationMatrix2D((cx_s, cy_s), float(ang), 1.0)  # affine rotation
+        return cv2.warpAffine(img_deg, M, (dw, dh), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_REFLECT)
+
+    def loss_sub(a: float) -> float:
+        """
+        Fast loss: mean circular AoLP difference computed only on the fixed subsample.
+        - Uses the same random pixels for all angles => stable objective landscape.
+        """
+        d2 = rotate_s(deg2s, a).ravel()                       # rotate target AoLP (scan scale)
+        return float(aolp_diff(deg1s_flat[sample], d2[sample]).mean())  # average difference on sampled pixels
+
+    def loss_full_scaled(a: float) -> float:
+        """
+        Dense loss (still at scan scale): mean circular AoLP difference across the whole circular mask.
+        - More accurate than subsample; used to verify best candidate(s).
+        """
+        d2 = rotate_s(deg2s, a)                               # rotate target AoLP fully
+        return float(aolp_diff(deg1s[mask_s], d2[mask_s]).mean())  # average across mask
+    
+    
+    
+    
+
+    # --- Multi-stage search over [0,360): coarse -> medium -> fine -> ultra-fine ---
+    coarse = np.arange(0.0, 360.0, 30.0, dtype=np.float32)    # 12 coarse probes (every 30°)
+    best0 = float(coarse[int(np.argmin([loss_sub(a) for a in coarse]))])  # pick best coarse bin
+
+    a10 = (np.arange(best0 - 45.0, best0 + 45.0, 10.0) % 360.0)  # window ±45° in 10° steps
+    best10 = float(a10[int(np.argmin([loss_sub(a) for a in a10]))])  # best within window
+
+    a01 = (np.arange(best10 - 5.0, best10 + 5.0, 0.1) % 360.0)   # ±5° in 0.1° steps
+    best01 = float(a01[int(np.argmin([loss_sub(a) for a in a01]))])  # refine near best
+
+    a001 = (np.arange(best01 - 1.0, best01 + 1.0, 0.01) % 360.0) # ±1° in 0.01° steps (ultra-fine)
+    best_angle = float(a001[int(np.argmin([loss_sub(a) for a in a001]))])  # finest minimum candidate
+    best_loss = loss_full_scaled(best_angle)                      # verify with dense mask loss
+
+    # --- Optional SGD polish: finite-difference gradient descent from best_angle ---
+    sgd_loss_hist = []                                           # to store loss per iteration for plotting
+    if USE_SGD:
+        ang = best_angle                                         # initialize at fine-search best
+        lr, eps, iters, decay = SGD_LR, SGD_EPS, SGD_ITERS, SGD_DECAY
+        best_sgd_angle, best_sgd_loss = ang, loss_sub(ang)       # track the best seen during SGD
+        for _ in range(iters):                                   # loop over iterations
+            L  = loss_sub(ang)                                   # current subsample loss
+            Lp = loss_sub(ang + eps)                             # forward probe
+            Lm = loss_sub(ang - eps)                             # backward probe
+            g  = (Lp - Lm) / (2 * eps)                           # symmetric finite-difference gradient
+            ang = wrap360(ang - lr * g)                          # gradient step with wrap-around
+            sgd_loss_hist.append(L)                              # record current loss
+            if L < best_sgd_loss:                                # keep best SGD angle (by subsample)
+                best_sgd_angle, best_sgd_loss = ang, L
+            lr *= decay                                          # anneal learning rate
+
+        cand_full_sgd = loss_full_scaled(best_sgd_angle)         # dense loss for SGD result
+        # pick final raw angle by comparing dense losses (fine-search vs SGD result)
+        final_angle_raw = (best_angle if best_loss <= cand_full_sgd else best_sgd_angle)
+    else:
+        final_angle_raw = best_angle                             # if SGD off, take fine-search result
+
+    # Closure to recompute subsample loss for any list of angles (for zoomed loss plot)
+    def subloss_for(angle_list):
+        return [loss_sub(a) for a in angle_list]
+
+    return wrap360(final_angle_raw), sgd_loss_hist, subloss_for  # return normalized angle + history + accessor
+
+
+
+
+
+# ----------------------- MAIN (single pair) -----------------------
+def main():
+    t0 = time.time()                                              # start timer to report total runtime
+
+    # Load color and grayscale versions of reference and target
+    img1c = cv2.imread(Reference_Path, cv2.IMREAD_COLOR)          # reference (color) for visualization
+    img2c = cv2.imread(Target_Path,    cv2.IMREAD_COLOR)          # target (color) for visualization
+    img1g = cv2.imread(Reference_Path, cv2.IMREAD_GRAYSCALE)      # reference AoLP as grayscale
+    img2g = cv2.imread(Target_Path,    cv2.IMREAD_GRAYSCALE)      # target AoLP as grayscale
+    if any(x is None for x in [img1c, img2c, img1g, img2g]):      # validate that all reads succeeded
+        raise FileNotFoundError("Check Reference_Path/Target_Path.")
+
+    img1g = img1g.astype(np.float32); img2g = img2g.astype(np.float32)  # cast to float for math ops
+
+    # Ensure target matches reference size (so rotations and masking align pixel-to-pixel)
+    if img1c.shape[:2] != img2c.shape[:2]:                        # if HxW mismatch in color images
+        img2c = cv2.resize(img2c, (img1c.shape[1], img1c.shape[0]), cv2.INTER_NEAREST)  # resize color
+        img2g = cv2.resize(img2g, (img1g.shape[1], img1g.shape[0]), cv2.INTER_NEAREST)  # resize gray
+
+    h, w = img1g.shape                                            # image dimensions
+    mask_full = build_mask(h, w)                                  # full-resolution circular mask
+
+    # Run rotation estimation (returns best raw angle in [0,360), SGD history, and a loss accessor)
+    best_raw, sgd_hist, subloss_for = rotation(img1g, img2g)
+
+    # If filename embeds a ground-truth angle (e.g., angle_21), use it to resolve AoLP's 180° ambiguity
+    true_ang = my_true_angle(os.path.basename(Target_Path))       # parse truth from filename or None
+    if true_ang is not None:
+        cand1 = wrap360(best_raw)                                 # branch 1: raw best
+        cand2 = wrap360(best_raw + 180.0)                         # branch 2: AoLP-symmetric counterpart
+        err1 = abs(shortest_angle(cand1 - true_ang))              # error distance to truth (branch 1)
+        err2 = abs(shortest_angle(cand2 - true_ang))              # error distance to truth (branch 2)
+        resolved = cand2 if err2 < err1 else cand1                # choose branch with smaller error
+    else:
+        resolved = wrap360(best_raw)                              # no truth => keep raw best
+
+    # Convert resolved [0,360) orientation to a minimal signed corrective rotation (≤180°, CW/CCW)
+    signed_delta = shortest_angle(resolved)                       # +CCW means rotate target CCW
+    dir_text = "CCW" if signed_delta >= 0 else "CW"               # label direction for display
+    abs_delta = abs(signed_delta)                                 # magnitude (degrees)
+
+    # Compute dense AoLP loss on full-res circular mask after applying the resolved angle
+    deg1_full = degree(img1g); deg2_full = degree(img2g)          # full-res AoLP degrees
+    d2_rot = rotate2d(deg2_full, resolved, w, h)                   # rotate target AoLP by resolved angle
+    full_loss = float(aolp_diff(deg1_full[mask_full], d2_rot[mask_full]).mean())  # average loss
+
+    # ----------------- VISUALIZATION -----------------
+    # 1) Three image panels: reference, target, and target rotated by shortest corrective angle
+    rot2c = rotate2d(img2c, signed_delta, w, h, interp=cv2.INTER_NEAREST)   # rotate color image minimally
+    plt.figure(figsize=(12, 4))                                             # wide figure
+    plt.subplot(1, 3, 1); plt.imshow(to_rgba(img1c, mask_full)); plt.title("Image 1"); plt.axis('off')
+    plt.subplot(1, 3, 2); plt.imshow(to_rgba(img2c, mask_full)); plt.title("Image 2"); plt.axis('off')
+    plt.subplot(1, 3, 3); plt.imshow(to_rgba(rot2c, mask_full)); plt.title(f"Rotated by {abs_delta:.4f}° {dir_text}"); plt.axis('off')
+    plt.tight_layout(); plt.show()                                           # render the 3-panel figure
+
+    # 2) Loss vs angle (zoomed): evaluate subsample loss in ±1° window around best_raw at 0.01° step
+    viz = (np.arange(best_raw - 1.0, best_raw + 1.0 + 1e-9, 0.01, dtype=np.float32)) % 360.0  # angle grid
+    viz_loss = subloss_for(viz.tolist())                                     # compute loss curve on same subsample
+    min_i = int(np.argmin(viz_loss))                                         # index of minimal loss in window
+    min_a, min_L = float(viz[min_i]), float(viz_loss[min_i])                 # coordinates of the minimum
+
+    plt.figure(figsize=(8, 4))                                               # loss-curve figure
+    plt.plot(viz, viz_loss, label="±1° @ 0.01°")                              # plot loss vs angle
+    plt.axvline(best_raw, ls='--', c='k', label=f"raw best {wrap360(best_raw):.4f}°")  # vertical marker
+    plt.legend()
+    plt.title("Loss vs Angle (subsample)")
+    plt.xlabel("Angle (deg)"); plt.ylabel("Loss"); plt.grid(True, alpha=0.3)
+    # annotate exact minimum (for clarity, like your example figure)
+    plt.annotate(f"x={min_a:.3f}°\nmin loss={min_L:.3f}", xy=(min_a, min_L),
+                 xytext=(min_a+0.2, min_L+0.15), arrowprops=dict(arrowstyle="->", lw=0.7))
+    plt.show()
+
+    # 3) SGD loss per iteration (if enabled): shows convergence behavior of the polish phase
+    if USE_SGD and len(sgd_hist) > 0:
+        plt.figure(figsize=(8, 4))
+        plt.plot(range(1, len(sgd_hist)+1), sgd_hist, marker='o')            # iteration vs loss
+        plt.title("SGD Loss per Iteration")
+        plt.xlabel("Iteration"); plt.ylabel("Loss"); plt.grid(True, alpha=0.3)
+        plt.show()
+        
+    # TEXT STATS: compact console report similar to your block
+    print(" Results ")
+    print(f"Raw best (0–360 CCW): {wrap360(best_raw):.4f}°")                 # best angle before 0/180 disambiguation
+    print(f"Resolved (0–360 CCW): {resolved:.4f}°")                          # branch chosen after symmetry check
+    print(f"Minimal corrective   : {abs_delta:.4f}° {dir_text}  ")           # shortest signed correction (CW/CCW)
+    print(f"Full-mask loss       : {full_loss:.6f}")                          # dense loss at resolved angle
+
+    if true_ang is not None:
+        err_raw = shortest_angle(wrap360(best_raw) - true_ang)               # error vs ground truth (raw branch)
+        err_res = shortest_angle(resolved - true_ang)                        # error vs ground truth (resolved)
+        print(f"True angle (filename): {true_ang:.4f}°")
+        print(f"Error (raw branch)   : {err_raw:+.4f}°")
+        print(f"Error (resolved)     : {err_res:+.4f}° ")
+
+    print(f"Execution time       : {time.time() - t0:.3f} s")                # total run time in seconds
+
+# ---- Run ----
+if __name__ == "__main__":   # this guard ensures main() runs only when this file is executed directly
+    main()                   # start the single-pair alignment workflow (loads, aligns, plots, prints)
