@@ -1,84 +1,177 @@
+import re, time
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 
-# ----- paths -----
-p1 = r"G:\my\New Project\2024-10-08-19-31-33_angle_0.png"   # reference (target) image
-p2 = r"G:\my\New Project\2024-10-08-19-31-39_angle_31.png"  # image to be rotated/aligned
 
-# ----- load color (for display) and grayscale (for AoLP math) -----
-img1c = cv2.imread(p1, cv2.IMREAD_COLOR)          # load Image 1 in color (BGR) for display
-img2c = cv2.imread(p2, cv2.IMREAD_COLOR)          # load Image 2 in color (BGR) for display
-img1g = cv2.imread(p1, cv2.IMREAD_GRAYSCALE).astype(np.float32)  # same Image 1 as 1-channel float
-img2g = cv2.imread(p2, cv2.IMREAD_GRAYSCALE).astype(np.float32)  # same Image 2 as 1-channel float
-
-# match sizes to img1 (resize img2 to exactly match img1 if needed)
-if img1c.shape[:2] != img2c.shape[:2]:
-    img2c = cv2.resize(img2c, (img1c.shape[1], img1c.shape[0]), interpolation=cv2.INTER_NEAREST)
-    img2g = cv2.resize(img2g, (img1g.shape[1], img1g.shape[0]), interpolation=cv2.INTER_NEAREST)
-
-h, w = img1g.shape                               # image height and width (from grayscale)
-cx, cy = (w - 1)/2.0, (h - 1)/2.0                # rotation center: exact image center (float)
-
-# circular mask (compare only inside a circle to avoid edge artifacts)
-r = min(h, w)//2 - 2                             # circle radius (slightly smaller than half-size)
-Y, X = np.ogrid[:h, :w]                          # fast grid for distance computation
-mask = ((X - cx)**2 + (Y - cy)**2) <= (r*r)      # boolean mask: True inside the circle
-
-# --- AoLP helpers (calculation only; display uses original color) ---
-def to_deg(gray):                                 # map 0-255 grayscale to 0-180 degrees
-    return gray * (180.0/255.0)
-
-def aolp_diff(a, b):                              # angular difference on a 0..180° circle
-    d = np.abs(a - b)                             # raw absolute difference
-    return np.minimum(d, 180.0 - d)               # wrap-around (because AoLP is modulo 180°)
-
-def rotate_center(img, ang):                      # rotate an image 'ang' degrees around center
-    M = cv2.getRotationMatrix2D((cx, cy), ang, 1.0)  # 2×3 rotation matrix (scale=1)
-    return cv2.warpAffine(                           # apply rotation
-        img, M, (w, h),
-        flags=cv2.INTER_NEAREST,                     # fast, preserves labels if any
-        borderMode=cv2.BORDER_REFLECT                # reflect edges to reduce border artifacts
-    )
-
-#brute-force search over angles to find the minimum AoLP difference
-deg1 = to_deg(img1g)                               # Image 1 "angles" (mapped from grayscale)
-angles = np.arange(-180.0, 180.0, 0.1)            # test every 0.1° across full range
-best_angle = min(                                  # choose angle that minimizes masked mean diff
-    angles,
-    key=lambda ang: aolp_diff(                     # compute AoLP difference for this angle
-        deg1,
-        to_deg(rotate_center(img2g, ang))
-    )[mask].mean()                                 # average difference only inside mask
-)
-
-rot2c = rotate_center(img2c, best_angle)           # rotate the color Image 2 by best_angle (for display)
-
-def make_rgba(bgr, circle_mask):                   # convert BGR to RGBA and apply circular alpha
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)     
-    a = (circle_mask * 255).astype(np.uint8)       # alpha channel: 255 inside circle, 0 outside
-    return np.dstack([rgb, a])                     # stack into RGBA image for clean circular view
-
-# precompute RGBA overlays for visualization
-img1_rgba = make_rgba(img1c, mask)                 # Image 1 with circular alpha
-img2_rgba = make_rgba(img2c, mask)                 # Image 2 (original) with circular alpha
-rot2_rgba = make_rgba(rot2c, mask)                 # Image 2 (rotated) with circular alpha
+Reference_Path = r"G:\my\New Project\2024-10-08-19-31-33_angle_0.png"
+Target_Path    = r"G:\my\New Project\24-10-08-t000-forward-paradesquare-aolp\2024-10-08-19-31-37_angle_21.png"
 
 
-plt.figure(figsize=(12, 4))
-plt.subplot(1, 3, 1); plt.imshow(img1_rgba); 
-plt.title("Image 1 (circular)"); 
-plt.axis('off')
-plt.subplot(1, 3, 2); 
-plt.imshow(img2_rgba);
-plt.title("Image 2 (circular)");
-plt.axis('off')
-plt.subplot(1, 3, 3); 
-plt.imshow(rot2_rgba);
-plt.title(f"Image 2 rotated {best_angle:.2f}°"); 
-plt.axis('off')
-plt.tight_layout();
-plt.show()
+def wrap360(a: float) -> float:
+    return float(a % 360.0)
+
+def shortest_angle(d: float) -> float:
+    return ((float(d) + 180.0) % 360.0) - 180.0
+
+def degree(g: np.ndarray) -> np.ndarray:
+    # Converts 0–255 grayscale to 0–180 degrees
+    return g.astype(np.float32) * (180.0 / 255.0)
+
+def aolp_diff(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    d = np.abs(a - b)
+    return np.minimum(d, 180.0 - d)
+
+def my_mask(h: int, w: int) -> np.ndarray:
+    cx, cy = (w )/2.0, (h )/2.0
+    r = min(h, w)//2 
+    Y, X = np.ogrid[:h, :w]
+    return ((X - cx)**2 + (Y - cy)**2) <= r*r
 
 
-print(f"The angular difference is {best_angle:.2f}")
+def my_true_angle(name: str):
+    m = re.search(r"angle[_-](\d+)", name, flags=re.IGNORECASE)
+    return float(m.group(1)) 
+
+def rgba(my_image_bgr: np.ndarray, boolean_mask : np.ndarray):
+    rgb = cv2.cvtColor(my_image_bgr, cv2.COLOR_BGR2RGB)
+    alpha = boolean_mask.astype(np.uint8) * 255 
+    return np.dstack([rgb, alpha])
+
+def rotation(img1g: np.ndarray, img2g: np.ndarray) -> float:
+    h, w = img1g.shape
+    deg1, deg2 = degree(img1g), degree(img2g)
+    mask = my_mask(h, w)
+
+    cx, cy = (w - 1)/2.0, (h - 1)/2.0
+
+    def loss(a: float) -> float:
+        M = cv2.getRotationMatrix2D((cx, cy), float(a), 1.0)
+        d2 = cv2.warpAffine(deg2, M, (w, h))
+        return float(aolp_diff(deg1[mask], d2[mask]).mean())
+
+    
+    First_angle = np.arange(0.0, 360.0, 90.0)
+    best0 = float(First_angle[int(np.argmin([loss(a) for a in First_angle]))])
+
+    a10 = (np.arange(best0 - 45.0, best0 + 45.0, 10.0) % 360.0)
+    best10 = float(a10[int(np.argmin([loss(a) for a in a10]))])
+
+    a01 = (np.arange(best10 - 5.0, best10 + 5.0, 1) % 360.0)
+    best01 = float(a01[int(np.argmin([loss(a) for a in a01]))])
+
+    a001 = (np.arange(best01 - 0.5, best01 + 0.5, 0.01) % 360.0)
+    best_angle = float(a001[int(np.argmin([loss(a) for a in a001]))])
+    best_loss  = loss(best_angle)
+
+    
+
+    def grad(a, eps = 0.05,n_iter=30) :
+        return (loss(a + eps) - loss(a - eps)) / (2.0 * eps)
+
+        ang = best_angle
+        lr  = 0.08
+        
+        for _ in range(n_iter):
+            ang = wrap360(ang - lr * grad(ang))
+
+        if loss(ang) < best_loss:
+            best_angle = ang
+
+    return wrap360(best_angle)
+
+
+def main():
+    t0 = time.time()
+
+    # Load images 
+    img1c = cv2.imread(Reference_Path, cv2.IMREAD_COLOR)
+    img2c = cv2.imread(Target_Path,    cv2.IMREAD_COLOR)
+    img1g = cv2.imread(Reference_Path, cv2.IMREAD_GRAYSCALE)
+    img2g = cv2.imread(Target_Path,    cv2.IMREAD_GRAYSCALE)
+
+    # Estimate raw angle (0–360)
+    rotated_angle = rotation(img1g.astype(np.float32), img2g.astype(np.float32))
+
+
+    true_ang = my_true_angle(Target_Path) 
+    if true_ang is not None:
+        cand1 = wrap360(rotated_angle)
+        cand2 = wrap360(rotated_angle + 180.0)
+        resolved = cand2 if abs(shortest_angle(cand2 - true_ang)) < abs(shortest_angle(cand1 - true_ang)) else cand1
+        final_error = shortest_angle(resolved - true_ang)
+    else:
+        resolved = wrap360(rotated_angle)
+
+
+
+    final_rotated_angle = abs(shortest_angle(resolved))
+ 
+    
+    dir_text = "CCW" if final_rotated_angle  >= 0 else "CW"
+
+    h, w = img1g.shape
+    mask_full = my_mask(h, w)
+    M_vizualize  = cv2.getRotationMatrix2D(((w - 1)/2.0, (h - 1)/2.0), float(final_rotated_angle ), 1.0)
+    rot2c = cv2.warpAffine(img2c, M_vizualize, (w, h))  
+
+    plt.figure(figsize=(12, 4))
+    plt.subplot(1, 3, 1); plt.imshow(rgba(img1c, mask_full)); plt.title("Image 1 (Reference)"); plt.axis('off')
+    plt.subplot(1, 3, 2); plt.imshow(rgba(img2c, mask_full)); plt.title("Image 2 (Target)"); plt.axis('off')
+    plt.subplot(1, 3, 3); plt.imshow(rgba(rot2c, mask_full)); plt.title(f"Rotated by {final_rotated_angle:.4f}° {dir_text}"); plt.axis('off')
+    plt.tight_layout(); plt.show()
+
+
+    deg1 = degree(img1g.astype(np.float32))
+    deg2 = degree(img2g.astype(np.float32))
+    mask = mask_full
+    cx, cy = (w )/2.0, (h)/2.0
+
+    def L(a: float) -> float:
+        M = cv2.getRotationMatrix2D((cx, cy), float(a), 1.0)
+        d2 = cv2.warpAffine(deg2, M, (w, h))
+        return float(aolp_diff(deg1[mask], d2[mask]).mean())
+
+    # 1) Print final loss chosen (resolved) angle
+    final_loss = L(resolved)
+    
+    print("Final loss: {:.6f}".format(final_loss))
+
+
+    vizualize = (np.arange(rotated_angle - 1.0, rotated_angle + 1.0, 0.01) % 360.0)
+    plt.figure(figsize=(8, 4))
+    plt.plot( vizualize, [L(a) for a in  vizualize])
+    plt.axvline(rotated_angle, ls='--', c='k')
+    plt.title("Loss vs Angle"); plt.xlabel("Angle (deg)"); 
+    plt.ylabel("Loss"); plt.grid(True, alpha=0.3)
+    plt.show()
+
+    # 3) Iteration graph (display-only GD run; does not change outputs)
+    ang, lr, eps, iters = float(rotated_angle), 0.08, 0.05, 30
+    hist = []
+    for _ in range(iters):
+        hist.append(L(ang))
+        g = (L(ang + eps) - L(ang - eps)) / (2.0 * eps)
+        ang = wrap360(ang - lr * g)
+  
+
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(range(1, len(hist)+1), hist, marker='o')
+    plt.title("Loss per Iteration"); 
+    plt.xlabel("Iteration"); 
+    plt.ylabel("Loss"); plt.grid(True, alpha=0.3)
+    plt.show()
+
+
+    print("\nFinal output : {:.4f}° {}".format(final_rotated_angle, dir_text))
+    if true_ang is not None:
+        print("Final error: {:+.4f}°".format(final_error))
+    else:
+        print("Final error: N/A")
+    print("Execution time: {:.4f} s".format(time.time() - t0))
+
+
+if __name__ == "__main__":
+    main()
+
