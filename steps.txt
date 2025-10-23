@@ -1,0 +1,123 @@
+import os, re, time
+import cv2
+import numpy as np
+import pandas as pd
+
+FOLDER = r"G:\my\New Project\24-10-08-t000-forward-paradesquare-aolp"
+excel  = os.path.join(FOLDER, "steps1.xlsx")
+
+def wrap360(a: float) -> float:
+    return float(a % 360.0)
+
+def shortest_angle(d: float) -> float:
+    return ((float(d) + 180.0) % 360.0) - 180.0
+
+def degree(g: np.ndarray) -> np.ndarray:
+    return g.astype(np.float32) * (180.0 / 255.0)
+
+def aolp_diff(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    d = np.abs(a - b)
+    return np.minimum(d, 180.0 - d)
+
+def my_mask(h: int, w: int) -> np.ndarray:
+    cx, cy = (w)/2.0, (h)/2.0
+    r = min(h, w)//2
+    Y, X = np.ogrid[:h, :w]
+    return ((X - cx)**2 + (Y - cy)**2) <= r*r
+
+def my_true_angle(name: str):
+    m = re.search(r"angle[_-](\d+)", name, flags=re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+def rotation(img1g: np.ndarray, img2g: np.ndarray) -> float:
+    h, w = img1g.shape
+    deg1, deg2 = degree(img1g), degree(img2g)
+    mask = my_mask(h, w)
+    cx, cy = (w - 1)/2.0, (h - 1)/2.0
+    
+    
+    def loss(a: float) -> float:
+        M  = cv2.getRotationMatrix2D((cx, cy), float(a), 1.0)
+        d2 = cv2.warpAffine(deg2, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+        return float(aolp_diff(deg1[mask], d2[mask]).mean())
+    
+    
+    First_angle = np.arange(0.0, 360.0, 90.0)
+    best0 = float(First_angle[int(np.argmin([loss(a) for a in First_angle]))])
+
+    a10 = (np.arange(best0 - 45.0, best0 + 45.0, 10.0) % 360.0)
+    best10 = float(a10[int(np.argmin([loss(a) for a in a10]))])
+
+    a01 = (np.arange(best10 - 5.0, best10 + 5.0, 1) % 360.0)
+    best01 = float(a01[int(np.argmin([loss(a) for a in a01]))])
+
+    a001 = (np.arange(best01 - 0.5, best01 + 0.5, 0.01) % 360.0)
+    best_angle = float(a001[int(np.argmin([loss(a) for a in a001]))])
+    best_loss  = loss(best_angle)
+
+    return wrap360(best_angle)
+
+
+def main():
+    t0 = time.time()
+
+    files = sorted(
+        os.path.join(FOLDER, f) for f in os.listdir(FOLDER)
+        if f.lower().endswith(".png")
+    )
+
+
+    angle_to_path = {}
+    for p in files:
+        a = my_true_angle(os.path.basename(p))
+        if a is not None:
+            angle_to_path[a] = p
+
+
+
+    results = []
+    
+
+    
+    for path in files:
+        name = os.path.basename(path)
+        true_ang = my_true_angle(name)
+        if true_ang == 0:
+            continue
+
+        ref_previous = true_ang - 1
+      
+
+        ref_path = angle_to_path[ref_previous]
+
+        img1g = cv2.imread(ref_path, cv2.IMREAD_GRAYSCALE)
+        img2g = cv2.imread(path,    cv2.IMREAD_GRAYSCALE)
+
+
+        img1g = img1g.astype(np.float32)
+        h, w  = img1g.shape
+        img2g = img2g.astype(np.float32)
+        if img2g.shape != (h, w):
+            img2g = cv2.resize(img2g, (w, h), interpolation=cv2.INTER_NEAREST)
+
+
+
+        prediction = shortest_angle(wrap360(rotation(img1g, img2g)))
+        error_deg = abs(shortest_angle(prediction - 1.0))
+
+        results.append([name, true_ang, prediction, error_deg])
+
+
+        print(f"Ref={ref_previous}°\tTarget={true_ang}°\tPred={prediction:.8f}°\tError={error_deg:.12f}°")
+
+    if results:
+        df = pd.DataFrame(results, columns=["File", "True_Angle(°)", "Predicted_Angle(°)", "Error(°)"])
+
+        errs = np.array([r[3] for r in results], dtype=float)
+        rmse_deg = float(np.sqrt(np.mean(errs**2))) 
+        df.loc[len(df.index)] = ["RMSE", "", "", rmse_deg]
+        df.to_excel(excel, index=False)
+        print(f"RMSE\t{rmse_deg:.5f}")
+
+if __name__ == "__main__":
+    main()
