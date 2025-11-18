@@ -73,11 +73,11 @@ def main():
     )
 
 
-    angle_to_path = {}
+    angles_path = {}
     for p in files:
         a = my_true_angle(os.path.basename(p))
         if a is not None:
-            angle_to_path[a] = p
+            angles_path[a] = p
 
 
 
@@ -94,7 +94,7 @@ def main():
         ref_previous = true_ang - 1
       
 
-        ref_path = angle_to_path[ref_previous]
+        ref_path = angles_path[ref_previous]
 
         img1g = cv2.imread(ref_path, cv2.IMREAD_GRAYSCALE)
         img2g = cv2.imread(path,    cv2.IMREAD_GRAYSCALE)
@@ -126,3 +126,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
